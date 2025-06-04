@@ -1,0 +1,6 @@
+.git/
+__pycache__/
+data/
+data_opt/
+.idea/
+*.pth
