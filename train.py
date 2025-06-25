@@ -1,4 +1,6 @@
 import random
+import time
+
 import numpy as np
 import torch,cv2,os
 from torch import sigmoid, nn, Tensor
@@ -14,13 +16,12 @@ from torch.utils.data import Dataset, DataLoader
 from data_augmentation import image_augment
 
 Image.MAX_IMAGE_PIXELS = None
-BATCH_SIZE = 4           # 每批次的样本数
-EPOCHS = 150              # 模型训练的总轮数
-LOG_GAP = 500            # 输出训练信息的间隔
-N_CLASSES = 5            # 图像分类种类数量
-IMG_SIZE = (512, 512)    # 图像缩放尺寸
+BATCH_SIZE = 8           # 每批次的样本数
+EPOCHS = 50              # 模型训练的总轮数
+# LOG_GAP = 500            # 输出训练信息的间隔
+N_CLASSES = 10            # 图像分类种类数量
+IMG_SIZE = (256, 256)    # 图像缩放尺寸
 INIT_LR = 3e-4           # 初始学习率
-MODEL_PATH = "UNet_pdparams.pth"  # 模型参数保存路径
 
 class UNet3Dataset(Dataset):
     '''
@@ -41,12 +42,24 @@ class UNet3Dataset(Dataset):
     def __len__(self):
         return len(self.data_list)
 
+# COLOR_MAP = {
+#     (0, 0, 0): 0,  # 背景
+#     (255, 0, 0): 1,       # 建筑物
+#     (0, 255, 0): 2,       # 植被
+#     (0, 0, 255): 3,       # 水域
+#     (255, 255, 0): 4,      # 道路
+# }
 COLOR_MAP = {
-    (0, 0, 0): 0,  # 背景
-    (255, 0, 0): 1,       # 建筑物
-    (0, 255, 0): 2,       # 植被
-    (0, 0, 255): 3,       # 水域
-    (255, 255, 0): 4,      # 道路
+    (0, 0, 0): 0,          # 黑色 -> 背景
+    (255, 0, 0): 1,        # 红色 -> 建筑物-被淹
+    (180, 120, 120): 2,    # 浅红色 -> 建筑物-未被淹
+    (160, 150, 20): 3,     # 橄榄绿色 -> 道路-被淹
+    (140, 140, 140): 4,    # 灰色 -> 道路-未被淹
+    (61, 230, 250): 5,     # 浅蓝色 -> 水域
+    (0, 82, 255): 6,       # 蓝色 -> 树木
+    (255, 0, 245): 7,      # 紫色 -> 车辆
+    (255, 235, 0): 8,      # 黄色 -> 游泳池
+    (4, 250, 7): 9         # 绿色 -> 草坪
 }
 
 def convert_mask(mask_img):
@@ -81,6 +94,20 @@ def image_transform(img_path, lab_path, augmentation=None):
     lab = torch.from_numpy(label_mask).long()  # shape [H, W]
 
     return img, lab
+
+def image_transform1(image_path, label_path,augment=None):
+    image = Image.open(image_path).convert('RGB')
+    label = Image.open(label_path).convert('L')
+    image = image.resize(IMG_SIZE)
+    label = label.resize(IMG_SIZE, Image.NEAREST)     #保留类别id
+    if augment is not None:
+        image, label = augment(image, label)
+
+    image = np.array(image).astype("float32").transpose((2, 0, 1))
+    image = torch.from_numpy(image/255.0)
+    label = torch.from_numpy(np.array(label, dtype=np.uint8)).long()
+
+    return image, label
 
 
 def get_data_list(image_dir, mask_dir, image_exts={".tif", ".png", ".jpg", ".jpeg"}):
@@ -209,7 +236,7 @@ class UNet3plus(nn.Module):
     '''
 
     def __init__(self,
-                 in_channels: int = 1,
+                 in_channels: int = 3,
                  n_classes: int = 5,
                  is_batchnorm: bool = True,
                  deep_sup: bool = False,
@@ -440,22 +467,60 @@ def dice_func(pred: np.ndarray, mask: np.ndarray,
 
     return scores
 
+
+def calculate_miou(pred, true, num_classes):
+    """
+        pred: 预测结果 (H, W)
+        true:实 真标签 (H, W)
+        num_classes: 类别总数（包含背景）
+        ious: 每个类别的IoU列表
+        miou: 平均IoU
+    """
+    # 确保输入是二维数组
+    if pred.ndim != 2 or true.ndim != 2:
+        raise ValueError("输入必须是二维数组（H, W）")
+
+    confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
+
+    for p, t in zip(pred.ravel(), true.ravel()):
+        if p < num_classes and t < num_classes:
+            confusion[p, t] += 1
+
+    ious = []
+    for c in range(num_classes):
+        tp = confusion[c, c]
+        fp = confusion[c, :].sum() - tp
+        fn = confusion[:, c].sum() - tp
+        union = tp + fp + fn
+        if union == 0:
+            iou = float('nan')  # 无交集时设为NaN
+        else:
+            iou = tp / union
+        ious.append(iou)
+
+    valid_ious = [iou for iou in ious if not np.isnan(iou)]
+    miou = np.nanmean(valid_ious) if valid_ious else 0.0
+
+    return ious, miou
+
 def evaluate(model, test_loader):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()  # 开启评估模式
     model.load_state_dict(torch.load('UNet_pdparams.pth', map_location=device))  # 载入预训练模型参数
     model.to(device)
     dice_accs = []
+    m_iou=0.0
 
     for batch_id, data in enumerate(test_loader):
         image, label = data
         image,label= image.to(device), label.to(device)
         pred = model(image)  # 预测结果
         pred = pred.argmax(axis=1).squeeze(axis=0).cpu().numpy()        #[H,W]
-        label = label.squeeze(0).squeeze(0).cpu().numpy()           #[H, W]
+        label = label.squeeze(0).cpu().numpy()           #[H, W]
         dice = dice_func(pred, label, N_CLASSES)  # 计算损失函数值
         dice_accs.append(np.mean(dice))
-    print("Eval \t Dice: %.5f" % (np.mean(dice_accs)))
+        _, m_iou = calculate_miou(pred, label, N_CLASSES)
+    print("Eval \t Dice: %.5f \t IOU: %.2f" % (np.mean(dice_accs)) %(m_iou))
 
 INDEX2COLOR = {v: k for k, v in COLOR_MAP.items()}
 def show_result(img_path, lab_path, pred):
@@ -500,25 +565,33 @@ def show_result(img_path, lab_path, pred):
 
 if __name__ == "__main__":
     # 训练初始化
-    train_image_dir = r"data\SAR\train"
-    train_mask_dir = r"data\LAB\train"
-    val_image_dir = r"data\SAR\test"
-    val_mask_dir = r"data\LAB\test"
+    # train_image_dir = r"data\SAR\train"
+    # train_mask_dir = r"data\LAB\train"
+    # val_image_dir = r"data\SAR\test"
+    # val_mask_dir = r"data\LAB\test"
+    # train_image_dir = r"output\images\train"
+    # train_mask_dir = r"output\labels\train"
+    # val_image_dir = r"output\images\test"
+    # val_mask_dir = r"output\labels\test"
+    train_image_dir = r"FloodNet\train\image"
+    train_mask_dir = r"FloodNet\train\label"
+    val_image_dir = r"FloodNet\test\image"
+    val_mask_dir = r"FloodNet\test\label"
     train_data_list = get_data_list(train_image_dir, train_mask_dir)
     test_data_list = get_data_list(val_image_dir, val_mask_dir)
     print("train_data_list is :", train_data_list.__len__())
     print("test_data_list is :", test_data_list.__len__())
-    train_dataset = UNet3Dataset(train_data_list, image_transform, image_augment)  # 训练集
-    test_dataset = UNet3Dataset(test_data_list, image_transform, augment=None)  # 测试集
+    train_dataset = UNet3Dataset(train_data_list, image_transform1, image_augment)  # 训练集
+    test_dataset = UNet3Dataset(test_data_list, image_transform1, augment=None)  # 测试集
     train_loader = DataLoader(train_dataset,  # 训练数据集
                               batch_size=BATCH_SIZE,  # 每批次的样本数
-                              num_workers=4,  # 加载数据的子进程数
+                              num_workers=8,  # 加载数据的子进程数
                               shuffle=True,  # 打乱数据集
                               drop_last=False)  # 不丢弃不完整的样本批次
 
     test_loader = DataLoader(test_dataset,  # 测试数据集
                              batch_size=1,  # 每批次的样本数
-                             num_workers=4,  # 加载数据的子进程数
+                             num_workers=8,  # 加载数据的子进程数
                              shuffle=False,  # 不打乱数据集
                              drop_last=False)  # 不丢弃不完整的样本批次
     # print("training pairs:", train_loader.__len__())
@@ -543,24 +616,25 @@ if __name__ == "__main__":
 
     for ep in range(EPOCHS):
         ep_loss_list = []
+        start_time = time.time()
         for batch_id, data in enumerate(train_loader):
             image, label = data
             image = image.to(device)
             label = label.to(device)
             pred = model(image)  # 预测结果
-            # print(type(image), type(label), type(pred[0]))
-            # print(image.shape, label.shape, pred[0].shape)
             loss = dice_loss(pred, label)  # 计算损失函数值
-            if batch_id % LOG_GAP == 0:  # 定期输出训练结果
-                print("Epoch：%2d，Batch：%3d，Loss：%.5f" % (ep, batch_id, loss))
+            # if batch_id % LOG_GAP == 0:  # 定期输出训练结果
+            #     print("Epoch：%2d，Batch：%3d，Loss：%.5f" % (ep, batch_id, loss))
             ep_loss_list.append(loss.item())
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
         scheduler.step()  # 衰减一次学习率
         loss_list.append(np.mean(ep_loss_list))
-        print("【Train】Epoch：%2d，Loss：%.5f" % (ep, loss_list[-1]))
-    torch.save(model.state_dict(), MODEL_PATH)  # 保存训练好的模型
+        epoch_time = time.time() - start_time
+        print("【Train】Epoch：%2d，Loss：%.5f, Cost Time: %.f seconds" % (ep, loss_list[-1], epoch_time))
+    torch.save(model.state_dict(), f'UNet3_pdparams_{IMG_SIZE[0]}_{EPOCHS}_{BATCH_SIZE}.pth')  # 保存训练好的模型
+
 
     evaluate(model, test_loader)
     #训练过程可视化

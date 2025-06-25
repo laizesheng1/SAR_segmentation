@@ -2,5 +2,8 @@
 __pycache__/
 data/
 data_opt/
+sar_lab_source/
+output/
+FloodNet/
 .idea/
 *.pth
